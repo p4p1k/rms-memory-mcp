@@ -1,0 +1,68 @@
+{
+  "name": "Windows patch check",
+  "on": { "workflow_dispatch": {} },
+  "permissions": { "contents": "read" },
+  "concurrency": {
+    "group": "windows-patch-check-${{ github.ref }}",
+    "cancel-in-progress": false
+  },
+  "jobs": {
+    "check-and-build": {
+      "runs-on": "windows-latest",
+      "timeout-minutes": 180,
+      "defaults": { "run": { "shell": "pwsh" } },
+      "env": {
+        "CARGO_BUILD_JOBS": "1",
+        "CARGO_PROFILE_DEV_DEBUG": "0",
+        "CARGO_PROFILE_TEST_DEBUG": "0",
+        "CARGO_INCREMENTAL": "0",
+        "CARGO_TERM_COLOR": "never"
+      },
+      "steps": [
+        {
+          "name": "Checkout selected commit (checkout v4)",
+          "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "with": { "ref": "${{ github.sha }}", "persist-credentials": false }
+        },
+        {
+          "name": "Check source and runner prerequisites",
+          "run": "$ErrorActionPreference = 'Stop'\ngit diff --check\nif ($LASTEXITCODE -ne 0) { throw 'Source whitespace check failed' }\n$vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio/Installer/vswhere.exe'\n$vc = & $vswhere -latest -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath\nif (-not $vc) { throw 'MSVC x64 tools not found' }\n$kit = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits/10/Lib'\nif (-not (Test-Path $kit)) { throw 'Windows SDK not found' }\n$free = (Get-PSDrive -Name ((Get-Location).Drive.Name)).Free / 1GB\nWrite-Host ('Free workspace space: {0:N1} GiB' -f $free)\nif ($free -lt 12) { throw 'Insufficient free space for a cold build' }\nGet-Command rustup.exe | Out-Null"
+        },
+        {
+          "name": "Install pinned Rust on hosted runner only",
+          "run": "$ErrorActionPreference = 'Stop'\nrustup toolchain install 1.96.1 --profile minimal --component rustfmt --component clippy --target x86_64-pc-windows-msvc\nif ($LASTEXITCODE -ne 0) { throw 'Rust setup failed' }\ncargo +1.96.1 --version\nif ($LASTEXITCODE -ne 0) { throw 'Cargo unavailable' }\nrustc +1.96.1 --version\nif ($LASTEXITCODE -ne 0) { throw 'Rust compiler unavailable' }"
+        },
+        {
+          "name": "Install protoc on hosted runner only (setup-protoc v3)",
+          "uses": "arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b",
+          "with": { "version": "36.2", "repo-token": "${{ github.token }}" }
+        },
+        {
+          "name": "Run regression and write tests; require nonzero test counts",
+          "run": "$ErrorActionPreference = 'Stop'\nprotoc --version\nif ($LASTEXITCODE -ne 0) { throw 'protoc unavailable' }\nforeach ($filter in @('tools::validation::tests', 'tools::write::tests')) {\n  $log = Join-Path $env:RUNNER_TEMP (($filter -replace ':', '_') + '.log')\n  & cargo +1.96.1 test --locked -p rms-memory-mcp --lib $filter -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log\n  $code = $LASTEXITCODE\n  if ($code -ne 0) { throw ('Tests failed: ' + $filter) }\n  $summary = Get-Content -Raw $log\n  if ($summary -notmatch 'test result: ok\\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw ('Missing complete successful test summary: ' + $filter) }\n}"
+        },
+        {
+          "name": "Build Windows EXE",
+          "run": "cargo +1.96.1 build --locked --release --target x86_64-pc-windows-msvc --bin rms-memory\nif ($LASTEXITCODE -ne 0) { throw 'Release build failed' }"
+        },
+        {
+          "name": "Verify EXE and prepare exact artifact files",
+          "id": "verified",
+          "run": "$ErrorActionPreference = 'Stop'\n$exe = Join-Path $env:GITHUB_WORKSPACE 'target/x86_64-pc-windows-msvc/release/rms-memory.exe'\n$version = & $exe --version\nif ($LASTEXITCODE -ne 0 -or $version -notmatch '\\b1\\.3\\.1\\b') { throw 'Built EXE version check failed' }\nWrite-Host $version\n$out = Join-Path $env:RUNNER_TEMP 'verified-windows-patch'\nNew-Item -ItemType Directory -Path $out | Out-Null\nCopy-Item -LiteralPath $exe -Destination (Join-Path $out 'rms-memory.exe')\n$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $out 'rms-memory.exe')).Hash.ToLowerInvariant()\n[IO.File]::WriteAllText((Join-Path $out 'SHA256SUMS.txt'), ($hash + '  rms-memory.exe' + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))\n('directory=' + $out) >> $env:GITHUB_OUTPUT\nWrite-Host ('Verified commit: ' + $env:GITHUB_SHA)"
+        },
+        {
+          "name": "Upload verified EXE and checksum only (upload-artifact v4)",
+          "if": "${{ success() && steps.verified.outcome == 'success' }}",
+          "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
+          "with": {
+            "name": "rms-memory-1.3.1-windows-path-fix-${{ github.sha }}",
+            "path": "${{ steps.verified.outputs.directory }}/rms-memory.exe\n${{ steps.verified.outputs.directory }}/SHA256SUMS.txt",
+            "if-no-files-found": "error",
+            "retention-days": 14,
+            "include-hidden-files": false
+          }
+        }
+      ]
+    }
+  }
+}
