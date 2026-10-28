@@ -422,38 +422,69 @@ impl Workspace {
     }
 
     pub fn find_markdown_files(&self) -> Result<Vec<PathBuf>> {
-        use glob::{Pattern, glob};
-        // A vault named `Notes [Work]` must not turn into a character class.
-        let root = Pattern::escape(&self.root.to_string_lossy());
-        let under_root = |pattern: &str| Pattern::new(&format!("{root}/{pattern}"));
+        use glob::Pattern;
+        // Keep filesystem roots out of glob syntax: escaping a Windows
+        // verbatim prefix turns `\\?\` into `\\[?]\`, which is a different root.
+        let canonical_root = fs::canonicalize(&self.root)?;
         let include_patterns = self
             .include
             .iter()
-            .map(|pattern| under_root(pattern))
+            .map(|pattern| Pattern::new(pattern))
             .collect::<Result<Vec<_>, _>>()?;
         let exclude_patterns = self
             .exclude
             .iter()
-            .map(|pattern| under_root(pattern))
+            .map(|pattern| Pattern::new(pattern))
             .collect::<Result<Vec<_>, _>>()?;
 
         let mut files = Vec::new();
-        for entry in glob(&format!("{root}/**/*.md"))? {
-            match entry {
-                Ok(path) => {
-                    let path_str = path.to_string_lossy();
-                    let included = include_patterns.iter().any(|p| p.matches(&path_str));
-                    let excluded = exclude_patterns.iter().any(|p| p.matches(&path_str));
-                    let canonical_excluded =
-                        crate::path_policy::is_vault_wiki_path(&self.root, &path)
-                            || is_in_hidden_dir(&self.root, &path);
-                    if included && !excluded && !canonical_excluded {
-                        files.push(path);
-                    }
+        let walker = walkdir::WalkDir::new(&self.root)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| {
+                entry.depth() == 0
+                    || (!crate::path_policy::is_vault_wiki_path(&self.root, entry.path())
+                        && !is_in_hidden_dir(&self.root, entry.path())
+                        && !(entry.file_type().is_dir()
+                            && entry.file_name().to_string_lossy().starts_with('.'))
+                        && (!entry.file_type().is_dir()
+                            || fs::canonicalize(entry.path()).is_ok_and(|resolved| {
+                                resolved.starts_with(&canonical_root)
+                            })))
+            });
+        for entry in walker {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().is_none_or(|extension| extension != "md") {
+                continue;
+            }
+            // WalkDir does not descend through directory symlinks/junctions.
+            // File symlinks are accepted only when their real target is a file
+            // inside this Vault. Reject dangling links and outside targets.
+            let resolved = match fs::canonicalize(path) {
+                Ok(resolved) => resolved,
+                Err(error) if entry.path_is_symlink() => {
+                    tracing::warn!("Skipping unresolvable Vault symlink {}: {error}", path.display());
+                    continue;
                 }
-                Err(e) => eprintln!("Error reading glob entry: {:?}", e),
+                Err(error) => return Err(error.into()),
+            };
+            if !resolved.starts_with(&canonical_root)
+                || !resolved.is_file()
+                || crate::path_policy::is_vault_wiki_path(&canonical_root, &resolved)
+                || is_in_hidden_dir(&canonical_root, &resolved)
+            {
+                continue;
+            }
+            let relative = path.strip_prefix(&self.root)?;
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            let included = include_patterns.iter().any(|p| p.matches(&relative));
+            let excluded = exclude_patterns.iter().any(|p| p.matches(&relative));
+            if included && !excluded {
+                files.push(path.to_path_buf());
             }
         }
+        files.sort();
         Ok(files)
     }
 
@@ -619,7 +650,7 @@ mod tests {
                 p.strip_prefix(&root)
                     .unwrap()
                     .to_string_lossy()
-                    .into_owned()
+                    .replace('\\', "/")
             })
             .collect::<Vec<_>>();
         found.sort();
@@ -644,6 +675,108 @@ mod tests {
             workspace.find_markdown_files().unwrap(),
             vec![root.join("daily/a.md")]
         );
+    }
+
+    fn discovery_workspace(root: PathBuf) -> Workspace {
+        Workspace {
+            code_path: root.clone(),
+            root,
+            include: vec!["**/*.md".to_string()],
+            exclude: vec![],
+            code_index_mode: CodeIndexMode::Off,
+            code_languages: vec![],
+        }
+    }
+
+    fn discovery_relative_files(workspace: &Workspace) -> Vec<String> {
+        workspace.find_markdown_files().unwrap().iter().map(|path| {
+            path.strip_prefix(&workspace.root).unwrap()
+                .to_string_lossy().replace('\\', "/")
+        }).collect()
+    }
+
+    fn discovery_ordinary_root(root: &Path) -> PathBuf {
+        #[cfg(windows)]
+        {
+            let text = root.to_str().unwrap();
+            if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+                return PathBuf::from(format!(r"\\{}", unc));
+            }
+            return PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text));
+        }
+        #[cfg(not(windows))]
+        root.to_path_buf()
+    }
+
+    #[test]
+    fn markdown_discovery_normal_and_canonical_roots_keep_filters_and_order() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["Plain Vault", "Notes [Work]"] {
+            let root = discovery_ordinary_root(&dir.path().join(name));
+            for relative in [
+                "z.md", "a.md", ".hidden.md", "daily/b.md", "daily/skip.md",
+                "other/c.md", "Wiki/index.md", "wiki/.generation/notes.md",
+                ".trash/hidden.md", "daily/.cache/hidden.md", "not-markdown.txt",
+            ] {
+                let path = root.join(relative);
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "# note").unwrap();
+            }
+            for candidate in [root.clone(), fs::canonicalize(&root).unwrap()] {
+                let mut workspace = discovery_workspace(candidate);
+                assert_eq!(discovery_relative_files(&workspace), vec![
+                    ".hidden.md", "a.md", "daily/b.md", "daily/skip.md", "other/c.md", "z.md",
+                ]);
+                workspace.include = vec!["daily/**/*.md".into(), "a.md".into()];
+                workspace.exclude = vec!["daily/skip.md".into()];
+                assert_eq!(discovery_relative_files(&workspace), vec!["a.md", "daily/b.md"]);
+                workspace.include.clear();
+                assert!(workspace.find_markdown_files().unwrap().is_empty());
+            }
+        }
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn markdown_discovery_keeps_file_links_inside_vault_and_never_follows_directory_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let root = discovery_ordinary_root(dir.path());
+        fs::write(root.join("inside.md"), "# inside").unwrap();
+        fs::create_dir(root.join("Wiki")).unwrap();
+        fs::write(root.join("Wiki/generated.md"), "# generated").unwrap();
+        fs::write(outside.path().join("outside.md"), "sentinel").unwrap();
+        #[cfg(unix)]
+        use std::os::unix::fs::{symlink as symlink_file, symlink as symlink_dir};
+        #[cfg(windows)]
+        use std::os::windows::fs::{symlink_file, symlink_dir};
+        symlink_file(root.join("inside.md"), root.join("alias.md"))
+            .expect("symlink privilege required");
+        symlink_file(outside.path().join("outside.md"), root.join("external.md")).unwrap();
+        symlink_file(outside.path().join("absent.md"), root.join("dangling.md")).unwrap();
+        symlink_file(root.join("Wiki/generated.md"), root.join("wiki-alias.md")).unwrap();
+        symlink_dir(outside.path(), root.join("escape")).unwrap();
+        #[cfg(windows)]
+        {
+            let status = std::process::Command::new("cmd.exe")
+                .args(["/D", "/C", "mklink", "/J"])
+                .arg(root.join("junction"))
+                .arg(discovery_ordinary_root(outside.path()))
+                .status().unwrap();
+            assert!(status.success(), "junction creation failed");
+        }
+        for candidate in [root.clone(), fs::canonicalize(&root).unwrap()] {
+            assert_eq!(discovery_relative_files(&discovery_workspace(candidate)),
+                vec!["alias.md", "inside.md"]);
+        }
+        assert_eq!(fs::read_to_string(outside.path().join("outside.md")).unwrap(), "sentinel");
+        #[cfg(windows)]
+        {
+            fs::remove_dir(root.join("escape")).unwrap();
+            fs::remove_dir(root.join("junction")).unwrap();
+        }
+        #[cfg(unix)]
+        fs::remove_file(root.join("escape")).unwrap();
     }
 
     #[test]
