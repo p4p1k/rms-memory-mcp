@@ -1,7 +1,24 @@
 {
   "name": "Windows patch check",
-  "on": { "workflow_dispatch": {} },
-  "permissions": { "contents": "read" },
+  "on": {
+    "workflow_dispatch": {
+      "inputs": {
+        "mode": {
+          "options": [
+            "baseline",
+            "patched"
+          ],
+          "type": "choice",
+          "default": "patched",
+          "description": "Reproduce original v1.3.1 graph failure, or check patched source",
+          "required": true
+        }
+      }
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
   "concurrency": {
     "group": "windows-patch-check-${{ github.ref }}",
     "cancel-in-progress": false
@@ -10,7 +27,11 @@
     "check-and-build": {
       "runs-on": "windows-latest",
       "timeout-minutes": 180,
-      "defaults": { "run": { "shell": "pwsh" } },
+      "defaults": {
+        "run": {
+          "shell": "pwsh"
+        }
+      },
       "env": {
         "CARGO_BUILD_JOBS": "1",
         "CARGO_PROFILE_DEV_DEBUG": "0",
@@ -22,7 +43,10 @@
         {
           "name": "Checkout selected commit (checkout v4)",
           "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
-          "with": { "ref": "${{ github.sha }}", "persist-credentials": false }
+          "with": {
+            "ref": "${{ inputs.mode == 'baseline' && '239806054d7c00e515d5add30848dae01b1d1d89' || github.sha }}",
+            "persist-credentials": false
+          }
         },
         {
           "name": "Check source and runner prerequisites",
@@ -35,24 +59,35 @@
         {
           "name": "Install protoc on hosted runner only (setup-protoc v3)",
           "uses": "arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b",
-          "with": { "version": "36.2", "repo-token": "${{ github.token }}" }
+          "with": {
+            "version": "36.2",
+            "repo-token": "${{ github.token }}"
+          }
+        },
+        {
+          "name": "Reproduce unchanged original graph test",
+          "if": "${{ inputs.mode == 'baseline' }}",
+          "run": "$ErrorActionPreference = 'Stop'\n$expected = '239806054d7c00e515d5add30848dae01b1d1d89'\n$actual = (git rev-parse HEAD).Trim()\nif ($LASTEXITCODE -ne 0 -or $actual -ne $expected) { throw 'Wrong baseline commit' }\n$test = 'tools::write::tests::successful_write_refreshes_vault_graph_neighbors'\n$log = Join-Path $env:RUNNER_TEMP 'original-graph-test.log'\n& cargo +1.96.1 test --locked -p rms-memory-mcp --lib $test -- --exact --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log\n$code = $LASTEXITCODE\n$text = Get-Content -Raw $log\nif ($code -eq 0) { throw 'Original test passed; hypothesis not reproduced' }\nif ($text -notmatch 'left: 0' -or $text -notmatch 'right: 1' -or $text -notmatch 'test result: FAILED\\. 0 passed; 1 failed;' -or $text -notmatch 'src[\\\\/]tools[\\\\/]write.rs:770:') { throw 'Unexpected baseline failure; investigate before patching' }\n'Confirmed original v1.3.1 graph assertion: left 0, right 1' >> $env:GITHUB_STEP_SUMMARY\n'Original test is unchanged; no EXE built or uploaded in baseline mode.' >> $env:GITHUB_STEP_SUMMARY"
         },
         {
           "name": "Run regression and write tests; require nonzero test counts",
-          "run": "$ErrorActionPreference = 'Stop'\nprotoc --version\nif ($LASTEXITCODE -ne 0) { throw 'protoc unavailable' }\nforeach ($filter in @('tools::validation::tests', 'tools::write::tests')) {\n  $log = Join-Path $env:RUNNER_TEMP (($filter -replace ':', '_') + '.log')\n  & cargo +1.96.1 test --locked -p rms-memory-mcp --lib $filter -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log\n  $code = $LASTEXITCODE\n  if ($code -ne 0) { throw ('Tests failed: ' + $filter) }\n  $summary = Get-Content -Raw $log\n  if ($summary -notmatch 'test result: ok\\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw ('Missing complete successful test summary: ' + $filter) }\n}"
+          "run": "$ErrorActionPreference = 'Stop'\nprotoc --version\nif ($LASTEXITCODE -ne 0) { throw 'protoc unavailable' }\nforeach ($filter in @('tools::validation::tests', 'tools::write::tests')) {\n  $log = Join-Path $env:RUNNER_TEMP (($filter -replace ':', '_') + '.log')\n  & cargo +1.96.1 test --locked -p rms-memory-mcp --lib $filter -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log\n  $code = $LASTEXITCODE\n  if ($code -ne 0) { throw ('Tests failed: ' + $filter) }\n  $summary = Get-Content -Raw $log\n  if ($summary -notmatch 'test result: ok\\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw ('Missing complete successful test summary: ' + $filter) }\n}",
+          "if": "${{ success() && inputs.mode == 'patched' }}"
         },
         {
           "name": "Build Windows EXE",
-          "run": "cargo +1.96.1 build --locked --release --target x86_64-pc-windows-msvc --bin rms-memory\nif ($LASTEXITCODE -ne 0) { throw 'Release build failed' }"
+          "run": "cargo +1.96.1 build --locked --release --target x86_64-pc-windows-msvc --bin rms-memory\nif ($LASTEXITCODE -ne 0) { throw 'Release build failed' }",
+          "if": "${{ success() && inputs.mode == 'patched' }}"
         },
         {
           "name": "Verify EXE and prepare exact artifact files",
           "id": "verified",
-          "run": "$ErrorActionPreference = 'Stop'\n$exe = Join-Path $env:GITHUB_WORKSPACE 'target/x86_64-pc-windows-msvc/release/rms-memory.exe'\n$version = & $exe --version\nif ($LASTEXITCODE -ne 0 -or $version -notmatch '\\b1\\.3\\.1\\b') { throw 'Built EXE version check failed' }\nWrite-Host $version\n$out = Join-Path $env:RUNNER_TEMP 'verified-windows-patch'\nNew-Item -ItemType Directory -Path $out | Out-Null\nCopy-Item -LiteralPath $exe -Destination (Join-Path $out 'rms-memory.exe')\n$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $out 'rms-memory.exe')).Hash.ToLowerInvariant()\n[IO.File]::WriteAllText((Join-Path $out 'SHA256SUMS.txt'), ($hash + '  rms-memory.exe' + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))\n('directory=' + $out) >> $env:GITHUB_OUTPUT\nWrite-Host ('Verified commit: ' + $env:GITHUB_SHA)"
+          "run": "$ErrorActionPreference = 'Stop'\n$exe = Join-Path $env:GITHUB_WORKSPACE 'target/x86_64-pc-windows-msvc/release/rms-memory.exe'\n$version = & $exe --version\nif ($LASTEXITCODE -ne 0 -or $version -notmatch '\\b1\\.3\\.1\\b') { throw 'Built EXE version check failed' }\nWrite-Host $version\n$out = Join-Path $env:RUNNER_TEMP 'verified-windows-patch'\nNew-Item -ItemType Directory -Path $out | Out-Null\nCopy-Item -LiteralPath $exe -Destination (Join-Path $out 'rms-memory.exe')\n$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $out 'rms-memory.exe')).Hash.ToLowerInvariant()\n[IO.File]::WriteAllText((Join-Path $out 'SHA256SUMS.txt'), ($hash + '  rms-memory.exe' + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))\n('directory=' + $out) >> $env:GITHUB_OUTPUT\nWrite-Host ('Verified commit: ' + $env:GITHUB_SHA)",
+          "if": "${{ success() && inputs.mode == 'patched' }}"
         },
         {
           "name": "Upload verified EXE and checksum only (upload-artifact v4)",
-          "if": "${{ success() && steps.verified.outcome == 'success' }}",
+          "if": "${{ success() && inputs.mode == 'patched' && steps.verified.outcome == 'success' }}",
           "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
           "with": {
             "name": "rms-memory-1.3.1-windows-path-fix-${{ github.sha }}",
