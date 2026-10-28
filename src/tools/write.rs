@@ -872,4 +872,36 @@ mod tests {
                 .contains("Successfully wrote")
         );
     }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_graph_refresh_with_plain_and_canonical_bracketed_roots() {
+        for canonical in [false, true] {
+            let dir = tempdir().unwrap();
+            let root = dir.path().join("Notes [Work]");
+            std::fs::create_dir(&root).unwrap();
+            std::fs::write(root.join("b.md"), "---\nid: doc-b\n---\n# B\n").unwrap();
+            let store = crate::store::Store::init(
+                &dir.path().join("db").to_string_lossy(), "memory",
+            ).await.unwrap();
+            let mut ctx = make_ctx(root);
+            if !canonical {
+                ordinary_windows_root(&mut ctx);
+            }
+            ctx.code_path = ctx.workspace_root.clone();
+            ctx.store = Some(store);
+            for mode in ["create", "replace"] {
+                let response = execute(&ctx, &write_args(
+                    "a.md", mode, "---\nid: doc-a\n---\n[Read B](b.md)\n",
+                )).await.unwrap();
+                assert_eq!(response["structuredContent"]["graph_refresh"]["status"], "ok");
+                let neighbors = crate::tools::graph::neighbors_for_path(
+                    ctx.store.as_ref().unwrap(), "a.md", 8,
+                ).await.unwrap();
+                assert_eq!(neighbors.len(), 1);
+                assert_eq!(neighbors[0]["direction"], "out");
+                assert_eq!(neighbors[0]["neighbor"]["path"], "b.md");
+            }
+        }
+    }
 }
