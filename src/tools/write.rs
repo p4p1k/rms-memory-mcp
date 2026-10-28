@@ -654,6 +654,90 @@ mod tests {
         assert!(payload["item_key"].as_str().is_some_and(|s| !s.is_empty()));
     }
 
+    #[cfg(windows)]
+    fn ordinary_windows_root(ctx: &mut AppContext) {
+        let text = ctx.workspace_root.as_ref().unwrap().to_str().unwrap();
+        let root = if let Some(unc) = text.strip_prefix(r"\\?\UNC\") {
+            PathBuf::from(format!(r"\\{}", unc))
+        } else {
+            PathBuf::from(text.strip_prefix(r"\\?\").unwrap_or(text))
+        };
+        ctx.workspace_root = Some(root);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_create_dry_run_and_append_with_ordinary_root() {
+        let dir = tempdir().unwrap();
+        let mut ctx = make_ctx(dir.path().to_path_buf());
+        ordinary_windows_root(&mut ctx);
+        let root = ctx.workspace_root.as_ref().unwrap().clone();
+        std::fs::create_dir(root.join("decisions")).unwrap();
+        for path in ["new.md", "decisions/new.md", r"missing\nested\new.md"] {
+            let mut args = write_args(path, "create", "# RMS Test\nRMS-2710");
+            args.insert("dry_run".into(), serde_json::json!(true));
+            let preview = parse_dry_run(&execute(&ctx, &args).await.unwrap());
+            assert_eq!(preview["action"], "create");
+            assert!(!root.join(path).exists());
+            assert!(!root.join("missing").exists());
+        }
+        for path in ["new.md", "decisions/new.md", r"missing\nested\new.md"] {
+            execute(&ctx, &write_args(path, "create", "# RMS Test\nRMS-2710"))
+                .await.unwrap();
+            let before = std::fs::read_to_string(root.join(path)).unwrap();
+            assert!(before.contains("RMS-2710"));
+            let mut args = write_args(path, "append", "second paragraph");
+            args.insert("dry_run".into(), serde_json::json!(true));
+            let preview = parse_dry_run(&execute(&ctx, &args).await.unwrap());
+            assert_eq!(preview["action"], "update");
+            assert_eq!(std::fs::read_to_string(root.join(path)).unwrap(), before);
+            args.insert("dry_run".into(), serde_json::json!(false));
+            execute(&ctx, &args).await.unwrap();
+            let after = std::fs::read_to_string(root.join(path)).unwrap();
+            assert!(after.contains("RMS-2710"));
+            assert!(after.contains("second paragraph"));
+        }
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_write_rejects_junction_and_symlink_escape_even_in_dry_run() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let mut ctx = make_ctx(dir.path().to_path_buf());
+        ordinary_windows_root(&mut ctx);
+        let root = ctx.workspace_root.as_ref().unwrap();
+        std::fs::write(outside.path().join("existing.md"), "sentinel").unwrap();
+        for link_kind in ["junction", "symlink"] {
+            let link = root.join("escape");
+            if link_kind == "junction" {
+                let status = std::process::Command::new("cmd.exe")
+                    .args(["/D", "/C", "mklink", "/J"])
+                    .arg(&link).arg(outside.path()).status().unwrap();
+                assert!(status.success(), "junction creation failed");
+            } else {
+                std::os::windows::fs::symlink_dir(outside.path(), &link)
+                    .expect("symlink privilege required");
+            }
+            for dry_run in [true, false] {
+                for (path, mode) in [
+                    ("escape/existing.md", "append"),
+                    ("escape/new.md", "create"),
+                    ("escape/missing/new.md", "create"),
+                ] {
+                    let mut args = write_args(path, mode, "must not be written");
+                    args.insert("dry_run".into(), serde_json::json!(dry_run));
+                    let error = execute(&ctx, &args).await.unwrap_err();
+                    assert!(error.to_string().contains("Path escapes vault boundary"), "{error}");
+                }
+            }
+            assert_eq!(std::fs::read_to_string(outside.path().join("existing.md")).unwrap(), "sentinel");
+            assert!(!outside.path().join("new.md").exists());
+            assert!(!outside.path().join("missing").exists());
+            std::fs::remove_dir(link).unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn dry_run_create_item_key_stable_across_plans() {
         let dir = tempdir().unwrap();
