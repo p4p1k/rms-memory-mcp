@@ -32,8 +32,19 @@ function Show-SmokeDiagnostics([string]$Phase) {
     if (Test-Path -LiteralPath "$state/dbs") {
         foreach ($file in Get-ChildItem -LiteralPath "$state/dbs" -Filter '.index.lock' -Recurse -Force) {
             Write-Host "INDEX_LOCK path=$($file.FullName) operation=read-owner-metadata"
-            try { Write-Host ([IO.File]::ReadAllText($file.FullName)) }
+            $ownerStream = $null
+            $ownerReader = $null
+            try {
+                $ownerStream = [IO.File]::Open($file.FullName, [IO.FileMode]::Open,
+                    [IO.FileAccess]::Read, ([IO.FileShare]::ReadWrite -bor [IO.FileShare]::Delete))
+                $ownerReader = [IO.StreamReader]::new($ownerStream)
+                Write-Host ($ownerReader.ReadToEnd())
+            }
             catch { Write-Host "INDEX_LOCK read-owner-metadata failed: $($_.Exception.ToString())" }
+            finally {
+                if ($null -ne $ownerReader) { $ownerReader.Dispose() }
+                elseif ($null -ne $ownerStream) { $ownerStream.Dispose() }
+            }
         }
     }
 }
@@ -144,10 +155,20 @@ try {
     'Windows stdio MCP smoke: dry-run, create, read, reindex, search PASS.' >> $env:GITHUB_STEP_SUMMARY
 } finally {
     if ($null -ne $process) {
-        if (-not $process.HasExited) { $process.Kill($true); $process.WaitForExit() }
+        if (-not $process.HasExited) {
+            $process.StandardInput.Close()
+            if (-not $process.WaitForExit(30000)) {
+                Write-Host 'STDIO_SHUTDOWN forced after EOF timeout'
+                $process.Kill($true)
+                $process.WaitForExit()
+            } else { Write-Host "STDIO_SHUTDOWN graceful exit_code=$($process.ExitCode)" }
+        }
         if ($null -ne (Get-Variable stderr -ErrorAction SilentlyContinue)) {
             Write-Host ($stderr.GetAwaiter().GetResult())
         }
+        $process.StandardInput.Dispose()
+        $process.StandardOutput.Dispose()
+        $process.StandardError.Dispose()
         $process.Dispose()
         $process = $null
         Show-SmokeDiagnostics 'after-stdio-closed'
