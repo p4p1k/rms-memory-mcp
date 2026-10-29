@@ -38,7 +38,9 @@
         "CARGO_PROFILE_TEST_DEBUG": "0",
         "CARGO_INCREMENTAL": "0",
         "CARGO_TERM_COLOR": "never",
-        "CARGO_HTTP_MULTIPLEXING": "false"
+        "CARGO_HTTP_MULTIPLEXING": "false",
+        "CARGO_PROFILE_RELEASE_OPT_LEVEL": "1",
+        "CARGO_PROFILE_RELEASE_LTO": "false"
       },
       "steps": [
         {
@@ -72,7 +74,7 @@
         },
         {
           "name": "Run regression and write tests; require nonzero test counts",
-          "run": "$ErrorActionPreference = 'Stop'\nprotoc --version\nif ($LASTEXITCODE -ne 0) { throw 'protoc unavailable' }\n$checks = @(\n  @{ Package = 'rms-memory-core'; Filter = 'workspace::tests::markdown_discovery' },\n  @{ Package = 'rms-memory-index'; Filter = 'vault_graph::tests' },\n  @{ Package = 'rms-memory-mcp'; Filter = 'tools::validation::tests' },\n  @{ Package = 'rms-memory-mcp'; Filter = 'tools::write::tests' }\n)\nforeach ($check in $checks) {\n  $log = Join-Path $env:RUNNER_TEMP (($check.Filter -replace ':', '_') + '.log')\n  & cargo +1.96.1 test --locked -p $check.Package --lib $check.Filter -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log\n  $code = $LASTEXITCODE\n  if ($code -ne 0) { throw ('Tests failed: ' + $check.Filter) }\n  $summary = Get-Content -Raw $log\n  if ($summary -notmatch 'test result: ok\\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw ('Missing complete successful test summary: ' + $check.Filter) }\n}",
+          "run": "$ErrorActionPreference = 'Stop'\nprotoc --version\nif ($LASTEXITCODE -ne 0) { throw 'protoc unavailable' }\n$checks = @(\n  @{ Package = 'rms-memory-core'; Filter = 'workspace::tests::markdown_discovery' },\n  @{ Package = 'rms-memory-index'; Filter = 'vault_graph::tests' },\n  @{ Package = 'rms-memory-index'; Filter = 'index_lock::tests' },\n  @{ Package = 'rms-memory-mcp'; Filter = 'tools::validation::tests' },\n  @{ Package = 'rms-memory-mcp'; Filter = 'tools::write::tests' },\n  @{ Package = 'rms-memory-mcp'; Filter = 'tools::read::tests' }\n)\nforeach ($check in $checks) {\n  $log = Join-Path $env:RUNNER_TEMP (($check.Filter -replace ':', '_') + '.log')\n  & cargo +1.96.1 test --locked -p $check.Package --lib $check.Filter -- --nocapture --test-threads=1 2>&1 | Tee-Object -FilePath $log\n  $code = $LASTEXITCODE\n  if ($code -ne 0) { throw ('Tests failed: ' + $check.Filter) }\n  $summary = Get-Content -Raw $log\n  if ($summary -notmatch 'test result: ok\\. [1-9][0-9]* passed; 0 failed; 0 ignored;') { throw ('Missing complete successful test summary: ' + $check.Filter) }\n}",
           "if": "${{ success() && inputs.mode == 'patched' }}"
         },
         {
