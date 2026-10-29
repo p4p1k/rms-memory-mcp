@@ -1,0 +1,46 @@
+{
+  "name": "Windows MCP smoke",
+  "on": {
+    "workflow_dispatch": {}
+  },
+  "permissions": {
+    "actions": "read",
+    "contents": "read"
+  },
+  "jobs": {
+    "smoke": {
+      "defaults": {
+        "run": {
+          "shell": "pwsh"
+        }
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@11d5960a326750d5838078e36cf38b85af677262",
+          "with": {
+            "fetch-depth": 0,
+            "persist-credentials": false
+          },
+          "name": "Checkout smoke harness"
+        },
+        {
+          "name": "Verify unchanged Rust source against tested Windows build",
+          "run": "$ErrorActionPreference = 'Stop'\n$source = '9a13cd6c12125695c0a2abdd7b7bb3251841deda'\ngit diff --exit-code $source HEAD -- src crates Cargo.toml Cargo.lock build.rs .cargo\nif ($LASTEXITCODE -ne 0) { throw 'Rust source differs from the verified EXE build' }\n'Binary source commit: ' + $source >> $env:GITHUB_STEP_SUMMARY"
+        },
+        {
+          "run": "$ErrorActionPreference = 'Stop'\n$out = Join-Path $env:RUNNER_TEMP 'patched-smoke-input'\ngh run download 40738239297 --repo $env:GITHUB_REPOSITORY --name 'rms-memory-1.3.1-windows-path-fix-9a13cd6c12125695c0a2abdd7b7bb3251841deda' --dir $out\nif ($LASTEXITCODE -ne 0) { throw 'Verified build download failed' }\n$sum = (Get-Content -Raw -LiteralPath (Join-Path $out 'SHA256SUMS.txt')).Trim()\nif ($sum -notmatch '^([a-f0-9]{64})  rms-memory\\.exe$') { throw 'Invalid checksum manifest' }\n$expected = $Matches[1]\n$actual = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $out 'rms-memory.exe')).Hash.ToLowerInvariant()\nif ($actual -ne $expected) { throw 'EXE checksum mismatch' }\nWrite-Host ('Verified EXE SHA-256: ' + $actual)\n'EXE SHA-256: ' + $actual >> $env:GITHUB_STEP_SUMMARY",
+          "env": {
+            "GH_TOKEN": "${{ github.token }}"
+          },
+          "name": "Download exact successful patched build"
+        },
+        {
+          "name": "Real stdio MCP smoke in clean Windows profile",
+          "run": "./.github/scripts/windows-mcp-smoke.ps1 -Exe \"$env:RUNNER_TEMP/patched-smoke-input/rms-memory.exe\""
+        }
+      ],
+      "timeout-minutes": 30,
+      "runs-on": "windows-latest"
+    }
+  }
+}
