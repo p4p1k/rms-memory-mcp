@@ -3,7 +3,7 @@ use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LockOwner {
@@ -20,16 +20,43 @@ pub enum LockInspection {
 
 pub struct IndexLock {
     file: File,
+    owner_path: PathBuf,
+}
+
+fn owner_path(storage_path: &str) -> PathBuf {
+    Path::new(storage_path).join(".index.lock.owner")
+}
+
+fn file_error(path: &Path, operation: &str, error: std::io::Error) -> anyhow::Error {
+    let context = format!(
+        "{operation} {}: {error} (raw={:?}, kind={:?}, pid={})",
+        path.display(), error.raw_os_error(), error.kind(), std::process::id()
+    );
+    anyhow::Error::new(error).context(context)
+}
+
+fn is_contended(error: &std::io::Error) -> bool {
+    error.raw_os_error() == fs2::lock_contended_error().raw_os_error()
+}
+
+fn remove_owner(path: &Path) -> Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(file_error(path, "remove owner metadata", error)),
+    }
 }
 
 fn open_lock_file(storage_path: &str) -> Result<File> {
     std::fs::create_dir_all(storage_path)?;
+    let path = Path::new(storage_path).join(".index.lock");
     Ok(OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(Path::new(storage_path).join(".index.lock"))?)
+        .open(&path)
+        .map_err(|error| file_error(&path, "open index lock", error))?)
 }
 
 fn read_owner(file: &mut File) -> Option<LockOwner> {
@@ -39,7 +66,7 @@ fn read_owner(file: &mut File) -> Option<LockOwner> {
     serde_json::from_str(metadata.trim()).ok()
 }
 
-fn write_owner(file: &mut File) -> Result<()> {
+fn write_owner(file: &mut File, owner_path: &Path) -> Result<()> {
     let owner = LockOwner {
         pid: std::process::id(),
         acquired_at: chrono::Utc::now().to_rfc3339(),
@@ -49,6 +76,11 @@ fn write_owner(file: &mut File) -> Result<()> {
     serde_json::to_writer(&mut *file, &owner)?;
     file.write_all(b"\n")?;
     file.sync_data()?;
+    // Windows mandatory byte-range locks prevent another handle from reading
+    // the locked file. Keep inspectable metadata outside the locked range/file.
+    // The OS lock remains the only authority; this file is diagnostic metadata.
+    std::fs::write(owner_path, serde_json::to_vec(&owner)?)
+        .map_err(|error| file_error(owner_path, "write owner metadata", error))?;
     Ok(())
 }
 
@@ -56,11 +88,12 @@ pub fn try_acquire(storage_path: &str) -> Result<Option<IndexLock>> {
     let mut file = open_lock_file(storage_path)?;
     match file.try_lock_exclusive() {
         Ok(()) => {
-            write_owner(&mut file)?;
-            Ok(Some(IndexLock { file }))
+            let owner_path = owner_path(storage_path);
+            write_owner(&mut file, &owner_path)?;
+            Ok(Some(IndexLock { file, owner_path }))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
-        Err(error) => Err(error.into()),
+        Err(error) if is_contended(&error) => Ok(None),
+        Err(error) => Err(file_error(&Path::new(storage_path).join(".index.lock"), "try_lock_exclusive", error)),
     }
 }
 
@@ -81,16 +114,19 @@ pub fn inspect(storage_path: &str) -> Result<LockInspection> {
             file.set_len(0)?;
             file.seek(SeekFrom::Start(0))?;
             file.sync_data()?;
-            file.unlock()?;
+            remove_owner(&owner_path(storage_path))?;
+            FileExt::unlock(&file)?;
             Ok(match stale_owner {
                 Some(owner) => LockInspection::StaleMetadataCleared(owner),
                 None => LockInspection::Unlocked,
             })
         }
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-            Ok(LockInspection::Active(read_owner(&mut file)))
+        Err(error) if is_contended(&error) => {
+            let owner = std::fs::read(owner_path(storage_path)).ok()
+                .and_then(|metadata| serde_json::from_slice(&metadata).ok());
+            Ok(LockInspection::Active(owner))
         }
-        Err(error) => Err(error.into()),
+        Err(error) => Err(file_error(&Path::new(storage_path).join(".index.lock"), "inspect try_lock_exclusive", error)),
     }
 }
 
@@ -99,7 +135,8 @@ impl Drop for IndexLock {
         let _ = self.file.set_len(0);
         let _ = self.file.seek(SeekFrom::Start(0));
         let _ = self.file.sync_data();
-        let _ = self.file.unlock();
+        let _ = remove_owner(&self.owner_path);
+        let _ = FileExt::unlock(&self.file);
     }
 }
 
@@ -109,6 +146,30 @@ mod tests {
     use std::fs::OpenOptions;
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
+
+    #[test]
+    fn same_process_contention_is_busy_and_release_allows_acquisition() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = dir.path().to_str().unwrap();
+        let owner = try_acquire(storage).unwrap().unwrap();
+        assert!(try_acquire(storage).unwrap().is_none());
+        match inspect(storage).unwrap() {
+            LockInspection::Active(Some(metadata)) => assert_eq!(metadata.pid, std::process::id()),
+            other => panic!("expected owner metadata under contention, got {other:?}"),
+        }
+        drop(owner);
+        assert!(!owner_path(storage).exists());
+        assert!(try_acquire(storage).unwrap().is_some());
+    }
+
+    #[test]
+    fn unrelated_file_errors_are_not_contention() {
+        let dir = tempfile::tempdir().unwrap();
+        let not_directory = dir.path().join("file");
+        std::fs::write(&not_directory, "not a directory").unwrap();
+        assert!(try_acquire(not_directory.to_str().unwrap()).is_err());
+        assert!(!is_contended(&std::io::Error::from(std::io::ErrorKind::PermissionDenied)));
+    }
 
     #[test]
     fn lock_records_owner_and_inspection_respects_os_lock() {
