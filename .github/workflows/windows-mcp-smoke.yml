@@ -35,6 +35,13 @@
           "name": "Download exact successful patched build"
         },
         {
+          "env": {
+            "CARGO_HTTP_MULTIPLEXING": "false"
+          },
+          "name": "Diagnose original v1.3.1 Windows index-lock contention",
+          "run": "./.github/scripts/windows-index-lock-diagnostic.ps1"
+        },
+        {
           "name": "Real stdio MCP smoke in clean Windows profile",
           "run": "./.github/scripts/windows-mcp-smoke.ps1 -Exe \"$env:RUNNER_TEMP/patched-smoke-input/rms-memory.exe\""
         }
