@@ -16,11 +16,34 @@ $env:RMS_MEMORY_NO_UPDATE_CHECK = '1'
 $env:RMS_MEMORY_EMBEDDING_MODEL = 'multilingual-e5-small'
 Push-Location -LiteralPath $project
 $process = $null
+function Show-SmokeDiagnostics([string]$Phase) {
+    $servers = @(Get-CimInstance Win32_Process -Filter "Name='rms-memory.exe'" |
+        Where-Object { $_.ExecutablePath -eq $Exe })
+    Write-Host "DIAGNOSTIC phase=$Phase server_count=$($servers.Count)"
+    foreach ($server in $servers) {
+        $native = Get-Process -Id $server.ProcessId
+        Write-Host "PID=$($server.ProcessId) parent=$($server.ParentProcessId) handles=$($native.HandleCount) command=$($server.CommandLine)"
+    }
+    if ($null -ne $process -and -not $process.HasExited) {
+        if ($servers.Count -ne 1 -or $servers[0].ProcessId -ne $process.Id) {
+            throw 'Unexpected MCP process count or PID'
+        }
+    } elseif ($servers.Count -ne 0) { throw 'Unexpected surviving RMS process' }
+    if (Test-Path -LiteralPath "$state/dbs") {
+        foreach ($file in Get-ChildItem -LiteralPath "$state/dbs" -Filter '.index.lock' -Recurse -Force) {
+            Write-Host "INDEX_LOCK path=$($file.FullName) operation=read-owner-metadata"
+            try { Write-Host ([IO.File]::ReadAllText($file.FullName)) }
+            catch { Write-Host "INDEX_LOCK read-owner-metadata failed: $($_.Exception.ToString())" }
+        }
+    }
+}
 try {
+    Show-SmokeDiagnostics 'before-config'
     & $Exe config --vault-path (Join-Path $lab 'Vaults') --auto-add false --inject-rules false --auto-import skip
     if ($LASTEXITCODE -ne 0) { throw 'Smoke configuration failed' }
     & $Exe init
     if ($LASTEXITCODE -ne 0) { throw 'Smoke project registration failed' }
+    Show-SmokeDiagnostics 'after-init-before-serve'
     $registry = Get-Content -Raw -LiteralPath "$state/registry.toml"
     if ($registry -notmatch '\[projects\.RmsPatchSmoke\]') { throw 'Test project not registered' }
     if (-not (Test-Path -LiteralPath $vault -PathType Container)) { throw 'Test Vault missing' }
@@ -39,6 +62,7 @@ try {
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'MCP did not start' }
+    Write-Host "STDIO_START pid=$($process.Id) parent=$PID stdin=redirected stdout=redirected stderr=redirected"
     $stderr = $process.StandardError.ReadToEndAsync()
     $script:rpcId = 0
     function Send-Rpc([string]$Method, [hashtable]$Params, [switch]$Notification) {
@@ -59,6 +83,7 @@ try {
         return $reply.result
     }
     function Call-Tool([string]$Name, [hashtable]$Arguments) {
+        Show-SmokeDiagnostics "before-$Name"
         $result = Send-Rpc 'tools/call' @{ name = $Name; arguments = $Arguments }
         if ($result.ContainsKey('isError') -and $result.isError) { throw "Tool failed: $Name" }
         return $result
@@ -87,12 +112,20 @@ try {
     if (-not (Test-Path -LiteralPath $note -PathType Leaf)) { throw 'Create did not create note' }
     if (-not (Get-Content -Raw -LiteralPath $note).Contains($arguments.content)) { throw 'Wrong file content' }
     Write-Host 'PASS: create commits the expected note'
-    # rms_read reads indexed chunks. Explicit sync avoids watcher debounce races.
-    $null = Call-Tool 'rms_sync' @{ project = 'RmsPatchSmoke' }
-    $read = Call-Tool 'rms_read' @{ project = 'RmsPatchSmoke'; path = $arguments.path }
-    if ($read.content[0].text -notmatch 'RMS Memory Test' -or
-        $read.content[0].text -notmatch 'Контрольный код: RMS-2710\.') { throw 'Read returned wrong content' }
-    Write-Host 'PASS: rms_read returns the expected content'
+    # Diagnose read independently, before sync. Neither failure is retried or swallowed.
+    $failures = [Collections.Generic.List[string]]::new()
+    try {
+        $read = Call-Tool 'rms_read' @{ project = 'RmsPatchSmoke'; path = $arguments.path }
+        if ($read.content[0].text -notmatch 'RMS Memory Test' -or
+            $read.content[0].text -notmatch 'Контрольный код: RMS-2710\.') { throw 'Read returned wrong content' }
+        Write-Host 'PASS: rms_read immediately after create, before rms_sync'
+    } catch { $failures.Add("immediate rms_read: $($_.Exception.Message)"); Write-Host "FAIL: $($failures[-1])" }
+    try {
+        $null = Call-Tool 'rms_sync' @{ project = 'RmsPatchSmoke' }
+        Write-Host 'PASS: rms_sync'
+    } catch { $failures.Add("rms_sync: $($_.Exception.Message)"); Write-Host "FAIL: $($failures[-1])" }
+    Show-SmokeDiagnostics 'after-independent-read-and-sync'
+    if ($failures.Count -ne 0) { throw ($failures -join [Environment]::NewLine) }
     $indexed = Payload (Call-Tool 'rms_reindex' @{ project = 'RmsPatchSmoke'; corpus = 'vault' })
     if ($indexed.vault_reindexed -ne $true) { throw 'Vault was not reindexed' }
     Write-Host 'PASS: explicit Vault reindex'
@@ -116,6 +149,13 @@ try {
             Write-Host ($stderr.GetAwaiter().GetResult())
         }
         $process.Dispose()
+        $process = $null
+        Show-SmokeDiagnostics 'after-stdio-closed'
+    }
+    if (Test-Path -LiteralPath "$state/rms.log") {
+        Write-Host 'RMS_LOG_BEGIN'
+        Get-Content -LiteralPath "$state/rms.log" -Tail 160 | Write-Host
+        Write-Host 'RMS_LOG_END'
     }
     Pop-Location
 }
