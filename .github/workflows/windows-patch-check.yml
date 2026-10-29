@@ -81,6 +81,13 @@
           "if": "${{ success() && inputs.mode == 'patched' }}"
         },
         {
+          "if": "${{ success() && inputs.mode == 'patched' }}",
+          "name": "Windows stdio MCP integration smoke",
+          "id": "smoke",
+          "run": "./.github/scripts/windows-mcp-smoke.ps1 -Exe \"$env:GITHUB_WORKSPACE/target/x86_64-pc-windows-msvc/release/rms-memory.exe\"",
+          "timeout-minutes": 25
+        },
+        {
           "name": "Verify EXE and prepare exact artifact files",
           "id": "verified",
           "run": "$ErrorActionPreference = 'Stop'\n$exe = Join-Path $env:GITHUB_WORKSPACE 'target/x86_64-pc-windows-msvc/release/rms-memory.exe'\n$version = & $exe --version\nif ($LASTEXITCODE -ne 0 -or $version -notmatch '\\b1\\.3\\.1\\b') { throw 'Built EXE version check failed' }\nWrite-Host $version\n$out = Join-Path $env:RUNNER_TEMP 'verified-windows-patch'\nNew-Item -ItemType Directory -Path $out | Out-Null\nCopy-Item -LiteralPath $exe -Destination (Join-Path $out 'rms-memory.exe')\n$hash = (Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $out 'rms-memory.exe')).Hash.ToLowerInvariant()\n[IO.File]::WriteAllText((Join-Path $out 'SHA256SUMS.txt'), ($hash + '  rms-memory.exe' + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))\n('directory=' + $out) >> $env:GITHUB_OUTPUT\nWrite-Host ('Verified commit: ' + $env:GITHUB_SHA)",
@@ -88,7 +95,7 @@
         },
         {
           "name": "Upload verified EXE and checksum only (upload-artifact v4)",
-          "if": "${{ success() && inputs.mode == 'patched' && steps.verified.outcome == 'success' }}",
+          "if": "${{ success() && inputs.mode == 'patched' && steps.smoke.outcome == 'success' && steps.verified.outcome == 'success' }}",
           "uses": "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02",
           "with": {
             "name": "rms-memory-1.3.1-windows-path-fix-${{ github.sha }}",
